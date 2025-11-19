@@ -5,11 +5,13 @@
 #include <string.h>
 #include <math.h>
 
-#include "nvds_meta.h"
-#include "nvds_meta_schema.h"
+#include "nvdsmeta.h"
 #include "nvds_version.h"
 
-// Estructura para la configuración de la app
+// Ajusta este ID según el modelo que uses en config_infer_primary.txt.
+// En muchos modelos de COCO, 0 = person.
+#define PERSON_CLASS_ID 0
+
 typedef struct {
     gchar *input_uri;
     gdouble roi_left;
@@ -20,43 +22,51 @@ typedef struct {
     gchar *report_path;
 } AppConfig;
 
-// Estado por objeto (muy simple para v0)
+// Estado por objeto
 typedef struct {
     gboolean inside;
     gdouble enter_time;   // tiempo de entrada actual al ROI
     gdouble total_time;   // tiempo acumulado dentro del ROI
-    gboolean alerted;     // si ya superó el tiempo limite
+    gboolean alerted;     // si ya superó el tiempo límite
 } ObjState;
 
-// Tabla global de objetos (id -> ObjState*)
-static GHashTable *g_obj_table = NULL;
-
-// Config global (para usarla en el pad probe)
+// Globals
 static AppConfig g_cfg = {0};
+static GHashTable *g_obj_table = NULL;
+static FILE *g_log_fp = NULL;
 
-// Función para calcular el tiempo en segundos a partir de buf_pts
+// Tiempo en segundos a partir de buf_pts o frame_num
 static gdouble
 get_frame_time_s(NvDsFrameMeta *frame_meta)
 {
-    // Usaremos buf_pts (nanosegundos) si viene seteado
     if (frame_meta->buf_pts != 0) {
         return (gdouble)frame_meta->buf_pts / 1e9;
     }
-    // Fallback: usar número de frame / 30 fps (por ejemplo)
+    // Fallback: asumir ~30 fps
     return (gdouble)frame_meta->frame_num / 30.0;
+}
+
+// ROI en pixeles (a partir de ROI normalizada)
+static void
+get_roi_pixels(NvDsFrameMeta *frame_meta,
+               gdouble *roi_x, gdouble *roi_y,
+               gdouble *roi_w, gdouble *roi_h)
+{
+    gdouble frame_w = frame_meta->source_frame_width;
+    gdouble frame_h = frame_meta->source_frame_height;
+
+    *roi_x = g_cfg.roi_left * frame_w;
+    *roi_y = g_cfg.roi_top * frame_h;
+    *roi_w = g_cfg.roi_width * frame_w;
+    *roi_h = g_cfg.roi_height * frame_h;
 }
 
 // Devuelve TRUE si el centro del bounding box está dentro de la ROI
 static gboolean
 bbox_inside_roi(NvDsFrameMeta *frame_meta, NvDsObjectMeta *obj_meta)
 {
-    gdouble frame_w = frame_meta->source_frame_width;
-    gdouble frame_h = frame_meta->source_frame_height;
-
-    gdouble roi_x = g_cfg.roi_left * frame_w;
-    gdouble roi_y = g_cfg.roi_top * frame_h;
-    gdouble roi_w = g_cfg.roi_width * frame_w;
-    gdouble roi_h = g_cfg.roi_height * frame_h;
+    gdouble roi_x, roi_y, roi_w, roi_h;
+    get_roi_pixels(frame_meta, &roi_x, &roi_y, &roi_w, &roi_h);
 
     gdouble x = obj_meta->rect_params.left;
     gdouble y = obj_meta->rect_params.top;
@@ -73,7 +83,7 @@ bbox_inside_roi(NvDsFrameMeta *frame_meta, NvDsObjectMeta *obj_meta)
     return FALSE;
 }
 
-// Función auxiliar para obtener / crear estado de un objeto
+// Obtener / crear estado de un objeto
 static ObjState *
 get_obj_state(guint64 obj_id)
 {
@@ -86,6 +96,51 @@ get_obj_state(guint64 obj_id)
     return st;
 }
 
+// Dibujar ROI en el frame: verde si vacía, roja si hay personas
+static void
+add_roi_display_meta(NvDsBatchMeta *batch_meta,
+                     NvDsFrameMeta *frame_meta,
+                     gboolean any_person_in_roi)
+{
+    NvDsDisplayMeta *display_meta =
+        nvds_acquire_display_meta_from_pool(batch_meta);
+    if (!display_meta)
+        return;
+
+    NvOSD_RectParams *rect_params = &display_meta->rect_params[0];
+
+    gdouble roi_x, roi_y, roi_w, roi_h;
+    get_roi_pixels(frame_meta, &roi_x, &roi_y, &roi_w, &roi_h);
+
+    rect_params->left   = roi_x;
+    rect_params->top    = roi_y;
+    rect_params->width  = roi_w;
+    rect_params->height = roi_h;
+    rect_params->border_width = 3;
+    rect_params->radius = 0;
+
+    // Sin fondo, solo borde de color
+    rect_params->has_bg_color = 0;
+
+    if (any_person_in_roi) {
+        // Rojo
+        rect_params->border_color.red   = 1.0f;
+        rect_params->border_color.green = 0.0f;
+        rect_params->border_color.blue  = 0.0f;
+        rect_params->border_color.alpha = 1.0f;
+    } else {
+        // Verde
+        rect_params->border_color.red   = 0.0f;
+        rect_params->border_color.green = 1.0f;
+        rect_params->border_color.blue  = 0.0f;
+        rect_params->border_color.alpha = 1.0f;
+    }
+
+    display_meta->num_rects = 1;
+
+    nvds_add_display_meta_to_frame(frame_meta, display_meta);
+}
+
 // Pad probe sobre nvdsosd (después de inferencia y tracker)
 static GstPadProbeReturn
 osd_sink_pad_buffer_probe(GstPad *pad, GstPadProbeInfo *info, gpointer user_data)
@@ -95,19 +150,25 @@ osd_sink_pad_buffer_probe(GstPad *pad, GstPadProbeInfo *info, gpointer user_data
     if (!batch_meta)
         return GST_PAD_PROBE_OK;
 
+    // Para cada frame del batch
     for (NvDsMetaList *l_frame = batch_meta->frame_meta_list;
          l_frame != NULL; l_frame = l_frame->next) {
 
         NvDsFrameMeta *frame_meta = (NvDsFrameMeta *)l_frame->data;
         gdouble t_now = get_frame_time_s(frame_meta);
 
+        gboolean any_person_in_roi = FALSE;
+
+        // Recorremos SOLO objetos de clase PERSON_CLASS_ID
         for (NvDsMetaList *l_obj = frame_meta->obj_meta_list;
              l_obj != NULL; l_obj = l_obj->next) {
 
             NvDsObjectMeta *obj_meta = (NvDsObjectMeta *)l_obj->data;
-            guint64 obj_id = obj_meta->object_id;
 
-            // DeepStream asigna object_id cuando hay tracker; si no, puede ser -1
+            if (obj_meta->class_id != PERSON_CLASS_ID)
+                continue;
+
+            guint64 obj_id = obj_meta->object_id;
             if (obj_id == (guint64)-1)
                 continue;
 
@@ -115,54 +176,63 @@ osd_sink_pad_buffer_probe(GstPad *pad, GstPadProbeInfo *info, gpointer user_data
             gboolean inside = bbox_inside_roi(frame_meta, obj_meta);
 
             if (inside) {
+                any_person_in_roi = TRUE;
+
                 if (!st->inside) {
                     // Entró al ROI
                     st->inside = TRUE;
                     st->enter_time = t_now;
                 } else {
-                    // Ya estaba dentro, acumular tiempo
+                    // Ya estaba dentro, acumular tiempo desde el último frame
                     gdouble dt = t_now - st->enter_time;
-                    st->total_time += dt;
-                    st->enter_time = t_now; // reset para el siguiente frame
+                    if (dt > 0.0) {
+                        st->total_time += dt;
+                    }
+                    st->enter_time = t_now;
 
                     if (!st->alerted && st->total_time >= g_cfg.time_limit) {
                         st->alerted = TRUE;
-                        g_print("ALERTA: objeto %lu excedió tiempo en ROI (%.2f s)\n",
+                        g_print("ALERTA: persona %lu excedió tiempo en ROI (%.2f s)\n",
                                 (unsigned long)obj_id, st->total_time);
-                        // Aquí más adelante podrías cambiar color ROI, etc.
                     }
                 }
             } else {
                 if (st->inside) {
                     // Salió del ROI, cerrar intervalo
                     gdouble dt = t_now - st->enter_time;
-                    st->total_time += dt;
+                    if (dt > 0.0) {
+                        st->total_time += dt;
+                    }
                     st->inside = FALSE;
                     st->enter_time = 0.0;
                 }
             }
         }
+
+        // Log por frame: timestamp + estado del ROI
+        if (g_log_fp) {
+            fprintf(g_log_fp, "%.3f\t%s\n",
+                    t_now,
+                    any_person_in_roi ? "person_in_roi" : "no_person_in_roi");
+            fflush(g_log_fp);
+        }
+
+        // Dibujar ROI con color según haya o no personas dentro
+        add_roi_display_meta(batch_meta, frame_meta, any_person_in_roi);
     }
 
     return GST_PAD_PROBE_OK;
 }
 
-// Función para generar un reporte muy simple al final
+// Escribir resumen al final (se agrega al log)
 static void
-write_report(const gchar *path)
+write_report(void)
 {
-    if (!path) return;
-
-    FILE *f = fopen(path, "w");
-    if (!f) {
-        g_printerr("No se pudo abrir archivo de reporte %s\n", path);
+    if (!g_log_fp)
         return;
-    }
 
-    fprintf(f, "ROI (normalizada): left=%.3f top=%.3f width=%.3f height=%.3f\n",
-            g_cfg.roi_left, g_cfg.roi_top, g_cfg.roi_width, g_cfg.roi_height);
-    fprintf(f, "Tiempo limite: %.2f s\n\n", g_cfg.time_limit);
-    fprintf(f, "Objeto\tTiempo_total_en_ROI(s)\tAlerta\n");
+    fprintf(g_log_fp, "\n# === Resumen por persona ===\n");
+    fprintf(g_log_fp, "# persona_id\ttiempo_total_en_ROI(s)\talerta\n");
 
     GHashTableIter iter;
     gpointer key, value;
@@ -170,21 +240,21 @@ write_report(const gchar *path)
     while (g_hash_table_iter_next(&iter, &key, &value)) {
         guint64 obj_id = (guint64)GPOINTER_TO_UINT(key);
         ObjState *st = (ObjState *)value;
-        fprintf(f, "%lu\t%.3f\t%s\n",
+        fprintf(g_log_fp, "%lu\t%.3f\t%s\n",
                 (unsigned long)obj_id,
                 st->total_time,
                 st->alerted ? "SI" : "NO");
     }
 
-    fclose(f);
-    g_print("Reporte escrito en %s\n", path);
+    fclose(g_log_fp);
+    g_log_fp = NULL;
+    g_print("Reporte escrito.\n");
 }
 
-// Parseo muy simple de argumentos
+// Parseo simple de argumentos
 static gboolean
 parse_args(int argc, char *argv[], AppConfig *cfg)
 {
-    // Defaults
     cfg->roi_left = 0.3;
     cfg->roi_top = 0.3;
     cfg->roi_width = 0.4;
@@ -228,7 +298,6 @@ main(int argc, char *argv[])
     GstBus *bus;
     GstMessage *msg;
     GstPad *osd_sink_pad;
-    GMainLoop *loop;
 
     gst_init(&argc, &argv);
 
@@ -236,14 +305,27 @@ main(int argc, char *argv[])
         return -1;
     }
 
-    // Crear la tabla de objetos
+    // Tabla de objetos
     g_obj_table = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, g_free);
 
-    // Ruta al archivo de configuración del modelo (ajusta esto)
-    const gchar *pgie_config_file = "/opt/nvidia/deepstream/deepstream-6.3/samples/configs/deepstream-app/config_infer_primary.txt";
+    // Abrir archivo de log
+    g_log_fp = fopen(g_cfg.report_path, "w");
+    if (!g_log_fp) {
+        g_printerr("No se pudo abrir archivo de reporte %s\n", g_cfg.report_path);
+        return -1;
+    }
 
-    // Pipeline básico para un solo video (batch-size=1)
-    // Nota: aquí simplifico usando uridecodebin para que soporte varios formatos
+    fprintf(g_log_fp, "# ROI (normalizada): left=%.3f top=%.3f width=%.3f height=%.3f\n",
+            g_cfg.roi_left, g_cfg.roi_top, g_cfg.roi_width, g_cfg.roi_height);
+    fprintf(g_log_fp, "# time_limit_s=%.2f\n", g_cfg.time_limit);
+    fprintf(g_log_fp, "# timestamp_s\tstate\n");
+    fflush(g_log_fp);
+
+    // Ruta al archivo de configuración del modelo (AJUSTAR en la Jetson)
+    const gchar *pgie_config_file =
+        "/opt/nvidia/deepstream/deepstream-6.3/samples/configs/deepstream-app/config_infer_primary.txt";
+
+    // Pipeline básico (1 fuente de video)
     gchar *pipeline_desc = g_strdup_printf(
         "uridecodebin uri=file://%s name=srcbin ! "
         "nvvideoconvert ! "
@@ -269,7 +351,6 @@ main(int argc, char *argv[])
         return -1;
     }
 
-    // Obtener el elemento nvdsosd por nombre y poner pad probe en su sink
     osd = gst_bin_get_by_name(GST_BIN(pipeline), "osd");
     if (!osd) {
         g_printerr("No se encontró elemento 'osd' en el pipeline\n");
@@ -292,10 +373,8 @@ main(int argc, char *argv[])
 
     // Ejecutar pipeline
     gst_element_set_state(pipeline, GST_STATE_PLAYING);
-
     bus = gst_element_get_bus(pipeline);
 
-    // Bucle simple hasta EOS o ERROR
     gboolean terminate = FALSE;
     while (!terminate) {
         msg = gst_bus_timed_pop_filtered(bus, GST_CLOCK_TIME_NONE,
@@ -332,10 +411,9 @@ main(int argc, char *argv[])
     gst_object_unref(bus);
     gst_object_unref(pipeline);
 
-    // Escribir reporte
-    write_report(g_cfg.report_path);
+    // Escribir resumen (se cierra el archivo)
+    write_report();
 
-    // Liberar memoria
     if (g_obj_table) {
         g_hash_table_destroy(g_obj_table);
     }
