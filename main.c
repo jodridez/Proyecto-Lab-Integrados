@@ -3,16 +3,19 @@
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
+#include <signal.h>
 #include "gstnvdsmeta.h"
-#include "nvds_analytics_meta.h"
+#include "nvdsmeta.h"
 
 /* Estructura para rastrear personas */
 typedef struct {
     guint64 person_id;
     GstClockTime entry_time;
     GstClockTime last_seen;
+    GstClockTime exit_time;
     gboolean time_exceeded;
     gboolean reported;
+    gboolean active;
     gfloat avg_confidence;
     guint frame_count;
 } TrackedPerson;
@@ -24,6 +27,7 @@ typedef struct {
     gint width;
     gint height;
     GHashTable *tracked_persons;
+    GList *all_detections;  // Lista para mantener todas las detecciones
     guint max_time_seconds;
     guint total_persons_detected;
     guint persons_exceeded_time;
@@ -83,6 +87,7 @@ static void init_roi_data(AppConfig *config) {
     roi_data.report_filename = g_strdup(config->report_file);
     roi_data.tracked_persons = g_hash_table_new_full(g_int64_hash, g_int64_equal, 
                                                       NULL, free_tracked_person);
+    roi_data.all_detections = NULL;
     roi_data.pipeline_start_time = 0;
 }
 
@@ -176,8 +181,10 @@ static GstPadProbeReturn osd_sink_pad_buffer_probe(GstPad *pad, GstPadProbeInfo 
                     person->person_id = person_id;
                     person->entry_time = current_time;
                     person->last_seen = current_time;
+                    person->exit_time = 0;
                     person->time_exceeded = FALSE;
                     person->reported = FALSE;
+                    person->active = TRUE;
                     person->avg_confidence = obj_meta->confidence;
                     person->frame_count = 1;
                     
@@ -185,12 +192,16 @@ static GstPadProbeReturn osd_sink_pad_buffer_probe(GstPad *pad, GstPadProbeInfo 
                     *key = person_id;
                     g_hash_table_insert(roi_data.tracked_persons, key, person);
                     
+                    // Agregar a la lista de todas las detecciones
+                    roi_data.all_detections = g_list_append(roi_data.all_detections, person);
+                    
                     roi_data.total_persons_detected++;
                     
                     g_print("Nueva persona detectada en ROI: ID=%lu\n", person_id);
                 } else {
                     // Actualizar persona existente
                     person->last_seen = current_time;
+                    person->active = TRUE;
                     person->frame_count++;
                     person->avg_confidence = (person->avg_confidence * (person->frame_count - 1) + 
                                             obj_meta->confidence) / person->frame_count;
@@ -229,12 +240,16 @@ static GstPadProbeReturn osd_sink_pad_buffer_probe(GstPad *pad, GstPadProbeInfo 
         TrackedPerson *person = (TrackedPerson *)value;
         gdouble time_since_seen = (gdouble)(current_time - person->last_seen) / GST_SECOND;
         
-        // Remover si no se ha visto en 2 segundos
-        if (time_since_seen > 2.0) {
+        // Marcar como inactivo si no se ha visto en 2 segundos
+        if (time_since_seen > 2.0 && person->active) {
+            person->active = FALSE;
+            person->exit_time = current_time;
+            g_print("Persona ID=%lu salió del ROI\n", person->person_id);
             to_remove = g_list_prepend(to_remove, key);
         }
     }
     
+    // Remover de la hash table activa pero mantener en all_detections
     for (GList *l = to_remove; l != NULL; l = l->next) {
         g_hash_table_remove(roi_data.tracked_persons, l->data);
     }
@@ -260,17 +275,15 @@ static void generate_report() {
     fprintf(fp, "Detected: %u (%u)\n", 
             roi_data.total_persons_detected, roi_data.persons_exceeded_time);
     
-    // Iterar sobre personas rastreadas y escribir información
-    GHashTableIter iter;
-    gpointer key, value;
-    
-    g_hash_table_iter_init(&iter, roi_data.tracked_persons);
-    while (g_hash_table_iter_next(&iter, &key, &value)) {
-        TrackedPerson *person = (TrackedPerson *)value;
+    // Iterar sobre TODAS las detecciones (no solo las activas)
+    for (GList *l = roi_data.all_detections; l != NULL; l = l->next) {
+        TrackedPerson *person = (TrackedPerson *)l->data;
         
         gdouble entry_time_sec = (gdouble)(person->entry_time - roi_data.pipeline_start_time) / 
                                 GST_SECOND;
-        gdouble duration = (gdouble)(person->last_seen - person->entry_time) / GST_SECOND;
+        
+        GstClockTime end_time = person->exit_time > 0 ? person->exit_time : person->last_seen;
+        gdouble duration = (gdouble)(end_time - person->entry_time) / GST_SECOND;
         
         gint minutes = (gint)(entry_time_sec / 60);
         gint seconds = (gint)entry_time_sec % 60;
@@ -286,6 +299,8 @@ static void generate_report() {
     
     fclose(fp);
     g_print("Reporte generado: %s\n", roi_data.report_filename);
+    g_print("Total personas detectadas: %u\n", roi_data.total_persons_detected);
+    g_print("Personas que excedieron tiempo: %u\n", roi_data.persons_exceeded_time);
 }
 
 /* ============================================================================
@@ -415,7 +430,12 @@ static GstElement* create_pipeline(AppConfig *config) {
     }
     
     // Configurar salidas según modo
-    if (g_strcmp0(config->mode, "udp") == 0 || g_strcmp0(config->mode, "udp_video") == 0) {
+    gboolean needs_udp = (g_strcmp0(config->mode, "udp") == 0 || 
+                          g_strcmp0(config->mode, "udp_video") == 0);
+    gboolean needs_file = (g_strcmp0(config->mode, "video") == 0 || 
+                           g_strcmp0(config->mode, "udp_video") == 0);
+    
+    if (needs_udp) {
         // Rama UDP
         queue1 = gst_element_factory_make("queue", "queue-udp");
         nvvidconv_out = gst_element_factory_make("nvvideoconvert", "nvvidconv-udp");
@@ -452,7 +472,7 @@ static GstElement* create_pipeline(AppConfig *config) {
         gst_object_unref(queue_udp_pad);
     }
     
-    if (g_strcmp0(config->mode, "video") == 0 || g_strcmp0(config->mode, "udp_video") == 0) {
+    if (needs_file) {
         // Rama archivo
         queue2 = gst_element_factory_make("queue", "queue-file");
         nvvidconv_file = gst_element_factory_make("nvvideoconvert", "nvvidconv-file");
@@ -482,6 +502,22 @@ static GstElement* create_pipeline(AppConfig *config) {
         }
         gst_object_unref(tee_file_pad);
         gst_object_unref(queue_file_pad);
+    }
+    
+    // Si no hay salidas configuradas, agregar fakesink
+    if (!needs_udp && !needs_file) {
+        GstElement *fakesink = gst_element_factory_make("fakesink", "fakesink");
+        g_object_set(G_OBJECT(fakesink), "sync", FALSE, NULL);
+        gst_bin_add(GST_BIN(pipeline), fakesink);
+        
+        GstPad *tee_fake_pad = gst_element_get_request_pad(tee, "src_%u");
+        GstPad *fake_sink_pad = gst_element_get_static_pad(fakesink, "sink");
+        if (gst_pad_link(tee_fake_pad, fake_sink_pad) != GST_PAD_LINK_OK) {
+            g_printerr("Error vinculando tee con fakesink\n");
+            return NULL;
+        }
+        gst_object_unref(tee_fake_pad);
+        gst_object_unref(fake_sink_pad);
     }
     
     // Agregar probe al pad del OSD
@@ -547,8 +583,37 @@ int main(int argc, char *argv[]) {
         return -1;
     }
     
-    if (g_strcmp0(config.mode, "video") == 0 && !config.output_file) {
-        g_printerr("Error: modo 'video' requiere --vo-file\n");
+    // Validar modo
+    if (g_strcmp0(config.mode, "video") != 0 && 
+        g_strcmp0(config.mode, "udp") != 0 && 
+        g_strcmp0(config.mode, "udp_video") != 0) {
+        g_printerr("Error: modo debe ser 'video', 'udp' o 'udp_video'\n");
+        return -1;
+    }
+    
+    if ((g_strcmp0(config.mode, "video") == 0 || 
+         g_strcmp0(config.mode, "udp_video") == 0) && !config.output_file) {
+        g_printerr("Error: modo '%s' requiere --vo-file\n", config.mode);
+        return -1;
+    }
+    
+    // Validar parámetros del ROI
+    if (config.roi_left < 0.0 || config.roi_left > 1.0 ||
+        config.roi_top < 0.0 || config.roi_top > 1.0 ||
+        config.roi_width <= 0.0 || config.roi_width > 1.0 ||
+        config.roi_height <= 0.0 || config.roi_height > 1.0) {
+        g_printerr("Error: parámetros del ROI deben estar entre 0.0 y 1.0\n");
+        return -1;
+    }
+    
+    if (config.roi_left + config.roi_width > 1.0 ||
+        config.roi_top + config.roi_height > 1.0) {
+        g_printerr("Error: ROI se sale de los límites de la imagen\n");
+        return -1;
+    }
+    
+    if (config.max_time == 0) {
+        g_printerr("Error: tiempo máximo debe ser mayor que 0\n");
         return -1;
     }
     
@@ -574,6 +639,7 @@ int main(int argc, char *argv[]) {
     }
     
     // Configurar bus
+    loop = g_main_loop_new(NULL, FALSE);
     GstBus *bus = gst_pipeline_get_bus(GST_PIPELINE(pipeline));
     guint bus_watch_id = gst_bus_add_watch(bus, bus_call, loop);
     gst_object_unref(bus);
@@ -586,7 +652,6 @@ int main(int argc, char *argv[]) {
     gst_element_set_state(pipeline, GST_STATE_PLAYING);
     
     // Loop principal
-    loop = g_main_loop_new(NULL, FALSE);
     g_main_loop_run(loop);
     
     // Limpieza
@@ -600,6 +665,7 @@ int main(int argc, char *argv[]) {
     g_main_loop_unref(loop);
     
     g_hash_table_destroy(roi_data.tracked_persons);
+    g_list_free(roi_data.all_detections);
     g_free(roi_data.report_filename);
     
     g_print("Aplicación finalizada\n");
