@@ -1,26 +1,51 @@
-# Makefile
+# Versión de CUDA en JetPack 4.6.x
+CUDA_VER:=10.2
 
-# Ajusta esta ruta según la versión de DeepStream de la Jetson
-DS_PATH ?= /opt/nvidia/deepstream/deepstream-6.3
+APP:=deepstream_roi
 
-CC      := gcc
+TARGET_DEVICE = $(shell gcc -dumpmachine | cut -f1 -d -)
 
-CFLAGS  := -Wall -Wextra -O2 \
-           -I$(DS_PATH)/sources/includes \
-           -I$(DS_PATH)/includes \
-           `pkg-config --cflags gstreamer-1.0 gstreamer-video-1.0`
+# Ruta de instalación de DeepStream en Jetson
+NVDS_PATH?=/opt/nvidia/deepstream/deepstream-6.0
+LIB_INSTALL_DIR?=$(NVDS_PATH)/lib
+APP_INSTALL_DIR?=$(NVDS_PATH)/bin
 
-LDFLAGS := `pkg-config --libs gstreamer-1.0 gstreamer-video-1.0` \
-           -L$(DS_PATH)/lib \
-           -lnvdsgst_meta -lnvds_meta -lnvds_infer -lnvds_infer_server -lnvds_utils
+ifeq ($(TARGET_DEVICE),aarch64)
+  CFLAGS:= -DPLATFORM_TEGRA
+endif
 
-all: roi_app
+CXX:=g++
+SRCS:= $(wildcard *.cpp)
+INCS:= $(wildcard *.h)
 
-roi_app: src/main.o
-	$(CC) -o $@ $^ $(LDFLAGS)
+PKGS:= gstreamer-1.0 gstreamer-video-1.0
 
-src/main.o: src/main.c
-	$(CC) -c $< -o $@ $(CFLAGS)
+OBJS:= $(SRCS:.cpp=.o)
+
+CFLAGS+= -I$(NVDS_PATH)/sources/includes \
+         -I$(NVDS_PATH)/includes \
+         -I/usr/local/cuda-$(CUDA_VER)/include
+
+CFLAGS+= $(shell pkg-config --cflags $(PKGS))
+
+LIBS:= $(shell pkg-config --libs $(PKGS))
+
+LIBS+= -L/usr/local/cuda-$(CUDA_VER)/lib64 -lcudart \
+       -L$(LIB_INSTALL_DIR) \
+       -lnvdsgst_meta -lnvds_meta \
+       -lnvbufsurface -lnvbufsurftransform \
+       -Wl,-rpath,$(LIB_INSTALL_DIR)
+
+all: $(APP)
+
+%.o: %.cpp $(INCS) Makefile
+	$(CXX) -c -o $@ $(CFLAGS) $<
+
+$(APP): $(OBJS) Makefile
+	$(CXX) -o $(APP) $(OBJS) $(LIBS)
+
+install: $(APP)
+	cp -v $(APP) $(APP_INSTALL_DIR)
 
 clean:
-	rm -f roi_app src/*.o
+	rm -f $(OBJS) $(APP)
