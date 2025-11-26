@@ -118,24 +118,36 @@ osd_sink_pad_buffer_probe (GstPad *pad, GstPadProbeInfo *info, gpointer u_data)
 
       NvDsObjectMeta *obj_meta = (NvDsObjectMeta *) l_obj->data;
 
-      // Para modelo resnet10 de ejemplo:
-      // class_id 0 = vehicle, 2 = person (ajusta si tu config usa otros IDs)
-      if (obj_meta->class_id == 0 || obj_meta->class_id == 2) {
+      // 1) OCULTAR TODO LO QUE NO SEA PERSONA EN EL OSD
+      if (obj_meta->class_id != 2) {
+        // Quitamos el recuadro y el fondo para que no se vea
+        obj_meta->rect_params.border_width = 0;
+        obj_meta->rect_params.has_bg_color = 0;
+        obj_meta->rect_params.bg_color.alpha = 0.0f;
+        obj_meta->rect_params.border_color.alpha = 0.0f;
 
-        float x = obj_meta->rect_params.left;
-        float y = obj_meta->rect_params.top;
-        float w = obj_meta->rect_params.width;
-        float h = obj_meta->rect_params.height;
+        // También podemos ocultar el texto (label)
+        obj_meta->text_params.display_text = NULL;
 
-        // Condición: TODO el bounding box dentro de la ROI
-        if (x >= roi_cfg.roi_x &&
-            x + w <= roi_cfg.roi_x + roi_cfg.roi_w &&
-            y >= roi_cfg.roi_y &&
-            y + h <= roi_cfg.roi_y + roi_cfg.roi_h) {
+        // No usamos este objeto para la ROI
+        continue;
+      }
 
-          roi_has_obj = TRUE;
-          break; // con uno basta para marcar que la ROI está ocupada
-        }
+      // 2) A partir de aquí SOLO PERSONAS (class_id == 2)
+
+      float x = obj_meta->rect_params.left;
+      float y = obj_meta->rect_params.top;
+      float w = obj_meta->rect_params.width;
+      float h = obj_meta->rect_params.height;
+
+      // Condición: TODO el bounding box dentro de la ROI
+      if (x >= roi_cfg.roi_x &&
+          x + w <= roi_cfg.roi_x + roi_cfg.roi_w &&
+          y >= roi_cfg.roi_y &&
+          y + h <= roi_cfg.roi_y + roi_cfg.roi_h) {
+
+        roi_has_obj = TRUE;
+        break; // con una persona basta para marcar la ROI ocupada
       }
     }
 
@@ -202,10 +214,8 @@ osd_sink_pad_buffer_probe (GstPad *pad, GstPadProbeInfo *info, gpointer u_data)
     rect_params->width  = roi_cfg.roi_w;
     rect_params->height = roi_cfg.roi_h;
     rect_params->border_width = 3;
-    rect_params->corner_radius = 0;
 
     rect_params->has_bg_color = 1;
-    rect_params->has_border_color = 1;
 
     // Colores RGBA (0–1)
     if (!roi_cfg.roi_occupied) {
@@ -288,7 +298,9 @@ main (int argc, char *argv[])
   GstElement *nvvidconv  = nullptr;
   GstElement *nvosd      = nullptr;
   GstElement *nvvidconv2 = nullptr;
-  GstElement *transform  = nullptr;
+  GstElement *encoder    = nullptr;
+  GstElement *h264parser2 = nullptr;
+  GstElement *mux        = nullptr;
   GstElement *sink       = nullptr;
 
   GstBus *bus = nullptr;
@@ -305,17 +317,20 @@ main (int argc, char *argv[])
   nvvidconv  = gst_element_factory_make ("nvvideoconvert", "nvvideo-converter");
   nvosd      = gst_element_factory_make ("nvdsosd", "nv-onscreendisplay");
   nvvidconv2 = gst_element_factory_make ("nvvideoconvert", "nvvideo-converter2");
-  transform  = gst_element_factory_make ("nvegltransform", "nvegl-transform");
-  sink       = gst_element_factory_make ("nveglglessink", "video-output");
-
+  encoder    = gst_element_factory_make ("nvv4l2h264enc", "h264-encoder");
+  h264parser2 = gst_element_factory_make ("h264parse", "h264-parser-2");
+  mux        = gst_element_factory_make ("qtmux", "mp4-mux");
+  sink       = gst_element_factory_make ("filesink", "file-sink");
+  
   if (!pipeline || !source || !qtdemux || !h264parser || !decoder ||
       !streammux || !pgie || !nvvidconv || !nvosd || !nvvidconv2 ||
-      !transform || !sink) {
+      !sink) {
     g_printerr ("No se pudo crear uno o más elementos. Saliendo.\n");
     return -1;
   }
 
   // Propiedades
+  
   g_object_set (G_OBJECT (source), "location", input_file, nullptr);
 
   g_object_set (G_OBJECT (streammux),
@@ -329,7 +344,7 @@ main (int argc, char *argv[])
                 "config-file-path", PGIE_CONFIG_FILE,
                 nullptr);
 
-  g_object_set (G_OBJECT (sink), "sync", FALSE, nullptr);
+  g_object_set (G_OBJECT (sink), "location", "output_roi.mp4", nullptr);
 
   // Bus
   bus = gst_pipeline_get_bus (GST_PIPELINE (pipeline));
@@ -340,7 +355,7 @@ main (int argc, char *argv[])
   gst_bin_add_many (GST_BIN (pipeline),
                     source, qtdemux, h264parser, decoder,
                     streammux, pgie, nvvidconv, nvosd,
-                    nvvidconv2, transform, sink, nullptr);
+                    nvvidconv2, encoder, h264parser2, mux, sink, nullptr);
 
   // Enlaces estáticos
   if (!gst_element_link (source, qtdemux)) {
@@ -353,10 +368,10 @@ main (int argc, char *argv[])
     return -1;
   }
 
-  if (!gst_element_link_many (streammux, pgie, nvvidconv, nvosd,
-                              nvvidconv2, transform, sink, nullptr)) {
-    g_printerr ("No se pudo enlazar streammux -> ... -> sink\n");
-    return -1;
+   if (!gst_element_link_many (streammux, pgie, nvvidconv, nvosd,
+                            nvvidconv2, encoder, h264parser2, mux, sink, nullptr)) {
+      g_printerr ("No se pudo enlazar streammux -> ... -> encoder -> mux -> sink\n");
+      return -1;
   }
 
   // Enlace dinámico qtdemux -> h264parse
