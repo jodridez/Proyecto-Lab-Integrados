@@ -43,11 +43,15 @@ static std::string input_file_path;
 static std::string output_file_path;
 static FILE *report_fp = nullptr;
 
-// Mapa para tracking de objetos individuales
 static std::map<guint64, TrackedObject> tracked_objects;
+
+// Para evitar contar la misma persona que sale/entra rápidamente
+static std::map<guint64, gdouble> recent_exits;  // object_id -> timestamp de salida
+#define REENTRY_COOLDOWN 2.0  // segundos antes de contar como nueva detección
 
 static guint g_total_detections = 0;
 static guint g_total_overtime   = 0;
+static guint g_unique_ids_seen  = 0;  // Para debugging
 static gdouble g_t0 = 0.0;
 
 typedef enum {
@@ -134,6 +138,7 @@ bus_call (GstBus *bus, GstMessage *msg, gpointer data)
     case GST_MESSAGE_EOS:
       g_print ("\n=== End of stream ===\n");
       g_print ("Detected: %u (%u)\n", g_total_detections, g_total_overtime);
+      g_print ("[DEBUG] IDs únicos vistos: %lu\n", recent_exits.size());
       
       // Escribir header del reporte
       write_report_header();
@@ -250,6 +255,18 @@ osd_sink_pad_buffer_probe (GstPad *pad, GstPadProbeInfo *info, gpointer u_data)
 
         // Si es nuevo objeto en ROI
         if (tracked_objects.find(obj_id) == tracked_objects.end()) {
+          
+          // Verificar si es una re-entrada reciente (mismo ID salió hace poco)
+          gboolean is_reentry = FALSE;
+          if (recent_exits.find(obj_id) != recent_exits.end()) {
+            gdouble time_since_exit = now - recent_exits[obj_id];
+            if (time_since_exit < REENTRY_COOLDOWN) {
+              is_reentry = TRUE;
+              g_print("   [DEBUG] Re-entrada rápida ID:%lu (%.1fs desde salida)\n", 
+                      obj_id, time_since_exit);
+            }
+          }
+          
           TrackedObject new_obj;
           new_obj.object_id = obj_id;
           new_obj.entry_ts = now;
@@ -258,9 +275,10 @@ osd_sink_pad_buffer_probe (GstPad *pad, GstPadProbeInfo *info, gpointer u_data)
           tracked_objects[obj_id] = new_obj;
 
           std::string ts = get_timestamp_str(now);
-          g_print("%s ENTER person [ID:%lu]%s\n", 
+          g_print("%s ENTER person [ID:%lu]%s%s\n", 
                   ts.c_str(), obj_id,
-                  low_conf ? " [LOW_CONF]" : "");
+                  low_conf ? " [LOW_CONF]" : "",
+                  is_reentry ? " [RE-ENTRY]" : "");
 
           if (report_fp) {
             gdouble rel = now - g_t0;
@@ -308,29 +326,36 @@ osd_sink_pad_buffer_probe (GstPad *pad, GstPadProbeInfo *info, gpointer u_data)
         gdouble dwell = now - obj.entry_ts;
         gboolean overtime = (dwell > roi_cfg.max_dwell_time);
 
+        // Contar esta persona
         g_total_detections++;
         if (overtime) {
           g_total_overtime++;
         }
+        
+        // Registrar este ID como salida reciente
+        recent_exits[obj_id] = now;
 
         std::string ts = get_timestamp_str(now);
         int dwell_sec = (int)(dwell + 0.5);
 
+        // Solo imprimir si no se había loggeado como OVERTIME antes
         if (!obj.overtime_logged) {
           g_print("%s person time %ds%s [ID:%lu]%s\n",
                   ts.c_str(), dwell_sec,
                   overtime ? " alert" : "",
                   obj_id,
                   obj.low_confidence ? " [LOW_CONF]" : "");
-        } else {
-          g_print("%s EXIT person [ID:%lu]\n", ts.c_str(), obj_id);
-        }
 
-        if (report_fp && !obj.overtime_logged) {
-          fprintf(report_fp, "%s person time %ds%s\n",
-                  ts.c_str(), dwell_sec,
-                  overtime ? " alert" : "");
-          fflush(report_fp);
+          if (report_fp) {
+            fprintf(report_fp, "%s person time %ds%s\n",
+                    ts.c_str(), dwell_sec,
+                    overtime ? " alert" : "");
+            fflush(report_fp);
+          }
+        } else {
+          // Ya se había mostrado el OVERTIME, solo mostrar EXIT
+          g_print("%s EXIT person [ID:%lu] (total time %ds)\n", 
+                  ts.c_str(), obj_id, dwell_sec);
         }
 
         it = tracked_objects.erase(it);
