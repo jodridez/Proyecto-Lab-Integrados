@@ -5,8 +5,6 @@
 #include <cuda_runtime_api.h>
 #include <iostream>
 #include <string>
-#include <map>
-#include <ctime>
 
 extern "C" {
 #include "gstnvdsmeta.h"
@@ -16,26 +14,22 @@ extern "C" {
 #define MUXER_OUTPUT_HEIGHT 720
 #define MUXER_BATCH_TIMEOUT_USEC 40000
 #define PGIE_CONFIG_FILE "/home/lab_sistemas/Proyecto-Lab-Integrados/dstest1_pgie_config.txt"
-#define CONFIDENCE_THRESHOLD 0.4  // Umbral para falsos positivos
 
 typedef struct {
   gdouble roi_x;      // normalizado (0-1)
   gdouble roi_y;      
   gdouble roi_w;      
   gdouble roi_h;      
-  gint roi_x_px;      // en píxeles
+  gint roi_x_px;      // en pixeles
   gint roi_y_px;
   gint roi_w_px;
   gint roi_h_px;
   gdouble max_dwell_time;  // segundos
-} RoiConfig;
 
-typedef struct {
-  guint64 object_id;
-  gdouble entry_ts;       // timestamp de entrada
-  gboolean overtime_logged; // ya se registró el overtime
-  gboolean low_confidence; // posible falso positivo
-} TrackedObject;
+  gboolean roi_occupied;
+  gboolean roi_over_threshold;
+  gdouble roi_entry_ts;    // segundos (reloj real)
+} RoiConfig;
 
 static RoiConfig roi_cfg;
 static std::string report_path;
@@ -43,15 +37,9 @@ static std::string input_file_path;
 static std::string output_file_path;
 static FILE *report_fp = nullptr;
 
-static std::map<guint64, TrackedObject> tracked_objects;
-
-// Para evitar contar la misma persona que sale/entra rápidamente
-static std::map<guint64, gdouble> recent_exits;  // object_id -> timestamp de salida
-#define REENTRY_COOLDOWN 2.0  // segundos antes de contar como nueva detección
-
+// Contadores para el log
 static guint g_total_detections = 0;
 static guint g_total_overtime   = 0;
-static guint g_unique_ids_seen  = 0;  // Para debugging
 static gdouble g_t0 = 0.0;
 
 typedef enum {
@@ -63,7 +51,7 @@ typedef enum {
 static OutputMode g_mode = MODE_VIDEO;
 
 /* ------------------------------------------------------------------------ */
-/* Función para convertir ROI normalizado a píxeles                         */
+/* Funcion para convertir ROI normalizado a pixeles                         */
 /* ------------------------------------------------------------------------ */
 static void
 calculate_roi_pixels()
@@ -75,7 +63,7 @@ calculate_roi_pixels()
 }
 
 /* ------------------------------------------------------------------------ */
-/* Función para obtener timestamp formateado mm:ss                          */
+/* Funcion para obtener timestamp formateado mm:ss                          */
 /* ------------------------------------------------------------------------ */
 static std::string
 get_timestamp_str(gdouble now)
@@ -138,7 +126,6 @@ bus_call (GstBus *bus, GstMessage *msg, gpointer data)
     case GST_MESSAGE_EOS:
       g_print ("\n=== End of stream ===\n");
       g_print ("Detected: %u (%u)\n", g_total_detections, g_total_overtime);
-      g_print ("[DEBUG] IDs únicos vistos: %lu\n", recent_exits.size());
       
       // Escribir header del reporte
       write_report_header();
@@ -164,7 +151,7 @@ bus_call (GstBus *bus, GstMessage *msg, gpointer data)
 }
 
 /* ------------------------------------------------------------------------ */
-/* Dynamic pad linking qtdemux -> h264parse                                 */
+/* Enlace dinamico qtdemux -> h264parse                                     */
 /* ------------------------------------------------------------------------ */
 static void
 cb_new_pad (GstElement *qtdemux, GstPad *pad, gpointer data)
@@ -176,7 +163,7 @@ cb_new_pad (GstElement *qtdemux, GstPad *pad, gpointer data)
     if (!gst_element_link_pads (qtdemux, name, h264parser, "sink")) {
       g_printerr ("No se pudo enlazar %s de qtdemux con sink de h264parse\n", name);
     } else {
-      g_print ("Enlazado dinámico: %s -> h264parse\n", name);
+      g_print ("Enlazado dinamico: %s -> h264parse\n", name);
     }
   }
 
@@ -184,7 +171,7 @@ cb_new_pad (GstElement *qtdemux, GstPad *pad, gpointer data)
 }
 
 /* ------------------------------------------------------------------------ */
-/* Pad probe en nvdsosd: tracking multi-objeto + ROI + tiempo              */
+/* Pad probe en nvdsosd: logica ROI + tiempo de permanencia + overlay       */
 /* ------------------------------------------------------------------------ */
 static GstPadProbeReturn
 osd_sink_pad_buffer_probe (GstPad *pad, GstPadProbeInfo *info, gpointer u_data)
@@ -205,21 +192,16 @@ osd_sink_pad_buffer_probe (GstPad *pad, GstPadProbeInfo *info, gpointer u_data)
 
     NvDsFrameMeta *frame_meta = (NvDsFrameMeta *) l_frame->data;
 
-    // Set para rastrear qué objetos están actualmente en ROI
-    std::map<guint64, bool> objects_in_roi_now;
-    
-    gboolean any_obj_in_roi = FALSE;
-    gboolean any_overtime = FALSE;
+    gboolean roi_has_obj = FALSE;
 
-    // Recorrer objetos detectados
+    // Recorremos objetos detectados
     for (NvDsMetaList *l_obj = frame_meta->obj_meta_list;
          l_obj != nullptr; l_obj = l_obj->next) {
 
       NvDsObjectMeta *obj_meta = (NvDsObjectMeta *) l_obj->data;
 
-      // Solo procesar personas (class_id == 2)
+      // 1) OCULTAR TODO LO QUE NO SEA PERSONA EN EL OSD
       if (obj_meta->class_id != 2) {
-        // Ocultar otros objetos
         obj_meta->rect_params.border_width = 0;
         obj_meta->rect_params.has_bg_color = 0;
         obj_meta->rect_params.bg_color.alpha = 0.0f;
@@ -228,144 +210,98 @@ osd_sink_pad_buffer_probe (GstPad *pad, GstPadProbeInfo *info, gpointer u_data)
         continue;
       }
 
-      // Coordenadas del bounding box
+      // 2) A partir de aqui SOLO PERSONAS (class_id == 2)
       float x = obj_meta->rect_params.left;
       float y = obj_meta->rect_params.top;
       float w = obj_meta->rect_params.width;
       float h = obj_meta->rect_params.height;
-      
-      // Convertir ROI normalizado a píxeles para comparación
+
+      // Convertir ROI normalizado a pixeles para comparacion
       float roi_x_px = roi_cfg.roi_x * MUXER_OUTPUT_WIDTH;
       float roi_y_px = roi_cfg.roi_y * MUXER_OUTPUT_HEIGHT;
       float roi_w_px = roi_cfg.roi_w * MUXER_OUTPUT_WIDTH;
       float roi_h_px = roi_cfg.roi_h * MUXER_OUTPUT_HEIGHT;
 
-      // Verificar si está dentro de ROI
+      // Condicion: TODO el bounding box dentro de la ROI
       if (x >= roi_x_px &&
           x + w <= roi_x_px + roi_w_px &&
           y >= roi_y_px &&
           y + h <= roi_y_px + roi_h_px) {
 
-        any_obj_in_roi = TRUE;
-        guint64 obj_id = obj_meta->object_id;
-        objects_in_roi_now[obj_id] = true;
-
-        // Detectar posibles falsos positivos (baja confianza)
-        gboolean low_conf = (obj_meta->confidence < CONFIDENCE_THRESHOLD);
-
-        // Si es nuevo objeto en ROI
-        if (tracked_objects.find(obj_id) == tracked_objects.end()) {
-          
-          // Verificar si es una re-entrada reciente (mismo ID salió hace poco)
-          gboolean is_reentry = FALSE;
-          if (recent_exits.find(obj_id) != recent_exits.end()) {
-            gdouble time_since_exit = now - recent_exits[obj_id];
-            if (time_since_exit < REENTRY_COOLDOWN) {
-              is_reentry = TRUE;
-              g_print("   [DEBUG] Re-entrada rápida ID:%lu (%.1fs desde salida)\n", 
-                      obj_id, time_since_exit);
-            }
-          }
-          
-          TrackedObject new_obj;
-          new_obj.object_id = obj_id;
-          new_obj.entry_ts = now;
-          new_obj.overtime_logged = FALSE;
-          new_obj.low_confidence = low_conf;
-          tracked_objects[obj_id] = new_obj;
-
-          std::string ts = get_timestamp_str(now);
-          g_print("%s ENTER person [ID:%lu]%s%s\n", 
-                  ts.c_str(), obj_id,
-                  low_conf ? " [LOW_CONF]" : "",
-                  is_reentry ? " [RE-ENTRY]" : "");
-
-          if (report_fp) {
-            gdouble rel = now - g_t0;
-            fprintf(report_fp, "%s person enter%s\n", 
-                    ts.c_str(),
-                    low_conf ? " (possible false positive)" : "");
-            fflush(report_fp);
-          }
-        } else {
-          // Objeto ya estaba siendo tracked
-          TrackedObject &obj = tracked_objects[obj_id];
-          gdouble dwell = now - obj.entry_ts;
-
-          // Verificar si superó el tiempo y no se ha loggeado
-          if (dwell > roi_cfg.max_dwell_time && !obj.overtime_logged) {
-            obj.overtime_logged = TRUE;
-            any_overtime = TRUE;
-
-            std::string ts = get_timestamp_str(now);
-            int dwell_sec = (int)(dwell + 0.5);
-            
-            g_print("%s person time %ds alert [ID:%lu]\n",
-                    ts.c_str(), dwell_sec, obj_id);
-
-            if (report_fp) {
-              fprintf(report_fp, "%s person time %ds alert\n",
-                      ts.c_str(), dwell_sec);
-              fflush(report_fp);
-            }
-          } else if (dwell > roi_cfg.max_dwell_time) {
-            any_overtime = TRUE;
-          }
-        }
+        roi_has_obj = TRUE;
+        break;
       }
     }
 
-    // Procesar objetos que SALIERON de la ROI
-    auto it = tracked_objects.begin();
-    while (it != tracked_objects.end()) {
-      guint64 obj_id = it->first;
-      
-      if (objects_in_roi_now.find(obj_id) == objects_in_roi_now.end()) {
-        // El objeto ya no está en ROI -> EXIT
-        TrackedObject &obj = it->second;
-        gdouble dwell = now - obj.entry_ts;
-        gboolean overtime = (dwell > roi_cfg.max_dwell_time);
+    if (roi_has_obj && !roi_cfg.roi_occupied) {
+      // Nuevo evento de ENTRADA
+      roi_cfg.roi_occupied = TRUE;
+      roi_cfg.roi_over_threshold = FALSE;
+      roi_cfg.roi_entry_ts = now;
 
-        // Contar esta persona
-        g_total_detections++;
-        if (overtime) {
-          g_total_overtime++;
-        }
-        
-        // Registrar este ID como salida reciente
-        recent_exits[obj_id] = now;
+      std::string ts = get_timestamp_str(now);
+      g_print ("%s ENTER\n", ts.c_str());
+
+      // En el CSV guardamos los segundos relativos
+      if (report_fp) {
+        gdouble rel = now - g_t0;
+        fprintf (report_fp, "ENTER,%.3f,,\n", rel);
+        fflush (report_fp);
+      }
+
+    } else if (!roi_has_obj && roi_cfg.roi_occupied) {
+      // Evento de SALIDA
+      gdouble dwell = now - roi_cfg.roi_entry_ts;
+      gboolean overtime = (dwell > roi_cfg.max_dwell_time);
+
+      g_total_detections++;
+      if (overtime) {
+        g_total_overtime++;
+      }
+
+      std::string ts = get_timestamp_str(now);
+      int dwell_sec = (int)(dwell + 0.5);
+
+      // Log en el formato pedido
+      g_print ("%s person time %ds%s\n",
+              ts.c_str(), dwell_sec, overtime ? " alert" : "");
+
+      // En el CSV guardamos tiempo relativo
+      if (report_fp) {
+        gdouble rel = now - g_t0;
+        fprintf (report_fp, "EXIT,%.3f,%.3f,%s\n",
+                rel, dwell, overtime ? "OVERTIME" : "OK");
+        fflush (report_fp);
+      }
+
+      roi_cfg.roi_occupied = FALSE;
+      roi_cfg.roi_over_threshold = FALSE;
+      roi_cfg.roi_entry_ts = 0.0;
+
+    } else if (roi_has_obj && roi_cfg.roi_occupied && !roi_cfg.roi_over_threshold) {
+      // Sigue dentro; ver si ya se paso del tiempo
+      gdouble dwell = now - roi_cfg.roi_entry_ts;
+      if (dwell > roi_cfg.max_dwell_time) {
+        roi_cfg.roi_over_threshold = TRUE;
 
         std::string ts = get_timestamp_str(now);
         int dwell_sec = (int)(dwell + 0.5);
 
-        // Solo imprimir si no se había loggeado como OVERTIME antes
-        if (!obj.overtime_logged) {
-          g_print("%s person time %ds%s [ID:%lu]%s\n",
-                  ts.c_str(), dwell_sec,
-                  overtime ? " alert" : "",
-                  obj_id,
-                  obj.low_confidence ? " [LOW_CONF]" : "");
+        g_print ("%s OVERTIME person time %ds (max %.0fs)\n",
+                ts.c_str(), dwell_sec, roi_cfg.max_dwell_time);
 
-          if (report_fp) {
-            fprintf(report_fp, "%s person time %ds%s\n",
-                    ts.c_str(), dwell_sec,
-                    overtime ? " alert" : "");
-            fflush(report_fp);
-          }
-        } else {
-          // Ya se había mostrado el OVERTIME, solo mostrar EXIT
-          g_print("%s EXIT person [ID:%lu] (total time %ds)\n", 
-                  ts.c_str(), obj_id, dwell_sec);
+        if (report_fp) {
+          gdouble rel = now - g_t0;
+          fprintf (report_fp, "OVERTIME,%.3f,%.3f,OVERTIME\n",
+                  rel, dwell);
+          fflush (report_fp);
         }
-
-        it = tracked_objects.erase(it);
-      } else {
-        ++it;
       }
     }
 
-    // Dibujar rectángulo de ROI con color según estado
-    NvDsDisplayMeta *display_meta = nvds_acquire_display_meta_from_pool(batch_meta);
+    // Dibujar rectangulo de la ROI con color segun estado
+    NvDsDisplayMeta *display_meta =
+      nvds_acquire_display_meta_from_pool (batch_meta);
     if (!display_meta)
       continue;
 
@@ -377,23 +313,25 @@ osd_sink_pad_buffer_probe (GstPad *pad, GstPadProbeInfo *info, gpointer u_data)
     rect_params->width  = roi_cfg.roi_w * MUXER_OUTPUT_WIDTH;
     rect_params->height = roi_cfg.roi_h * MUXER_OUTPUT_HEIGHT;
     rect_params->border_width = 3;
+
     rect_params->has_bg_color = 1;
 
-    // Estado 1: ROI vacía -> verde suave
-    if (!any_obj_in_roi) {
+    // TRES ESTADOS:
+    // Estado 1: ROI sin persona -> verde suave
+    if (!roi_cfg.roi_occupied) {
       rect_params->bg_color.red   = 0.0f;
       rect_params->bg_color.green = 0.6f;
       rect_params->bg_color.blue  = 0.0f;
       rect_params->bg_color.alpha = 0.2f;
 
-    // Estado 2: objetos dentro pero sin sobretiempo -> verde marcado
-    } else if (any_obj_in_roi && !any_overtime) {
+    // Estado 2: persona dentro PERO dentro del tiempo -> verde oscuro
+    } else if (roi_cfg.roi_occupied && !roi_cfg.roi_over_threshold) {
       rect_params->bg_color.red   = 0.0f;
       rect_params->bg_color.green = 0.9f;
       rect_params->bg_color.blue  = 0.0f;
       rect_params->bg_color.alpha = 0.3f;
 
-    // Estado 3: al menos un objeto con sobretiempo -> rojo
+    // Estado 3: persona dentro y SOBRETIEMPO -> rojo
     } else {
       rect_params->bg_color.red   = 0.9f;
       rect_params->bg_color.green = 0.0f;
@@ -407,7 +345,7 @@ osd_sink_pad_buffer_probe (GstPad *pad, GstPadProbeInfo *info, gpointer u_data)
     rect_params->border_color.blue  = 1.0f;
     rect_params->border_color.alpha = 1.0f;
 
-    nvds_add_display_meta_to_frame(frame_meta, display_meta);
+    nvds_add_display_meta_to_frame (frame_meta, display_meta);
   }
 
   return GST_PAD_PROBE_OK;
@@ -420,7 +358,7 @@ static gboolean
 parse_arguments(int argc, char *argv[])
 {
   if (argc < 2) {
-    g_printerr("Uso: %s vi-file <video.mp4> --left <val> --top <val> --width <val> --height <val> --time <s> --file-name <reporte.txt> vo-file <salida.mp4> --mode <video|udp|both>\n", argv[0]);
+    g_printerr("Uso: %s vi-file <video.mp4> --left <val> --top <val> --width <val> --height <val> --time <s> --file-name <reporte.csv> vo-file <salida.mp4> --mode <video|udp|both>\n", argv[0]);
     return FALSE;
   }
 
@@ -470,7 +408,7 @@ parse_arguments(int argc, char *argv[])
       } else if (g_strcmp0(mode_str, "both") == 0 || g_strcmp0(mode_str, "udp_video") == 0) {
         g_mode = MODE_BOTH;
       } else {
-        g_printerr("Modo inválido: %s (use: video | udp | both)\n", mode_str);
+        g_printerr("Modo invalido: %s (use: video | udp | both)\n", mode_str);
         return FALSE;
       }
       has_mode = TRUE;
@@ -479,8 +417,8 @@ parse_arguments(int argc, char *argv[])
 
   if (!has_input || !has_left || !has_top || !has_width || !has_height ||
       !has_time || !has_report || !has_output || !has_mode) {
-    g_printerr("Faltan parámetros requeridos\n");
-    g_printerr("Ejemplo: %s vi-file street.mp4 --left 0.2 --top 0.3 --width 0.5 --height 0.4 --time 5 --file-name report.txt vo-file output.mp4 --mode video\n", argv[0]);
+    g_printerr("Faltan parametros requeridos\n");
+    g_printerr("Ejemplo: %s vi-file street.mp4 --left 0.2 --top 0.3 --width 0.5 --height 0.4 --time 5 --file-name report.csv vo-file output.mp4 --mode video\n", argv[0]);
     return FALSE;
   }
 
@@ -499,15 +437,22 @@ main (int argc, char *argv[])
     return -1;
   }
 
-  // Calcular ROI en píxeles
+  // Calcular ROI en pixeles
   calculate_roi_pixels();
 
-  // Abrir archivo de reporte
+  // Inicializar estado de ROI
+  roi_cfg.roi_occupied = FALSE;
+  roi_cfg.roi_over_threshold = FALSE;
+  roi_cfg.roi_entry_ts = 0.0;
+
+  // Abrir archivo de reporte CSV
   report_fp = fopen(report_path.c_str(), "w");
   if (!report_fp) {
     g_printerr("No se pudo abrir el archivo de reporte %s\n", report_path.c_str());
     return -1;
   }
+  fprintf(report_fp, "event,time,dwell,flag\n");
+  fflush(report_fp);
 
   GMainLoop *loop = g_main_loop_new(nullptr, FALSE);
 
@@ -541,7 +486,7 @@ main (int argc, char *argv[])
       !encoder || !h264parser2 || !mux || !sink ||
       !encoder_udp || !payloader || !udp_sink ||
       !tee || !queue_file || !queue_udp) {
-    g_printerr("No se pudo crear uno o más elementos. Saliendo.\n");
+    g_printerr("No se pudo crear uno o mas elementos. Saliendo.\n");
     return -1;
   }
 
@@ -619,7 +564,7 @@ main (int argc, char *argv[])
     gst_object_unref(srcpad);
   }
 
-  // Configurar salida según modo
+  // Configurar salida segun modo
   if (g_mode == MODE_VIDEO) {
     gst_bin_add_many(GST_BIN(pipeline), encoder, h264parser2, mux, sink, nullptr);
     if (!gst_element_link_many(nvvidconv2, encoder, h264parser2, mux, sink, nullptr)) {
@@ -677,19 +622,18 @@ main (int argc, char *argv[])
     gst_object_unref(osd_sink_pad);
   }
 
-  // Imprimir configuración
-  g_print("\n=== Configuración del Sistema ===\n");
+  // Imprimir configuracion
+  g_print("\n=== Configuracion del Sistema ===\n");
   g_print("Archivo de entrada: %s\n", input_file_path.c_str());
   g_print("ROI (normalizado): left: %.2f top: %.2f width: %.2f height: %.2f\n",
           roi_cfg.roi_x, roi_cfg.roi_y, roi_cfg.roi_w, roi_cfg.roi_h);
-  g_print("ROI (píxeles): left: %d top: %d width: %d height: %d\n",
+  g_print("ROI (pixeles): left: %d top: %d width: %d height: %d\n",
           roi_cfg.roi_x_px, roi_cfg.roi_y_px, roi_cfg.roi_w_px, roi_cfg.roi_h_px);
-  g_print("Tiempo máximo: %.0fs\n", roi_cfg.max_dwell_time);
+  g_print("Tiempo maximo: %.0fs\n", roi_cfg.max_dwell_time);
   g_print("Modo: %s\n", g_mode == MODE_VIDEO ? "video" : 
                         g_mode == MODE_UDP ? "udp" : "both");
   g_print("Reporte: %s\n", report_path.c_str());
   g_print("Salida: %s\n", output_file_path.c_str());
-  g_print("Umbral de confianza: %.2f\n", CONFIDENCE_THRESHOLD);
   g_print("================================\n\n");
 
   gst_element_set_state(pipeline, GST_STATE_PLAYING);
