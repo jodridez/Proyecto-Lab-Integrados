@@ -15,7 +15,7 @@ extern "C" {
 #define MUXER_BATCH_TIMEOUT_USEC 40000
 
 // Ajusta esta ruta al PGIE de deepstream-test1 si es distinto en tu Nano
-#define PGIE_CONFIG_FILE "/opt/nvidia/deepstream/deepstream-6.0/sources/apps/sample_apps/deepstream-test1/dstest1_pgie_config.txt"
+#define PGIE_CONFIG_FILE "/home/lab_sistemas/Proyecto-Lab-Integrados/dstest1_pgie_config.txt"
 
 typedef struct {
   gdouble roi_x;
