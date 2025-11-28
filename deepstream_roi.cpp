@@ -271,7 +271,7 @@ osd_sink_pad_buffer_probe (GstPad *pad, GstPadProbeInfo *info, gpointer u_data)
         rect->bg_color = (NvOSD_ColorParams){0.0f, 0.9f, 0.0f, 0.3f};
       } else {
         // Rojo (Alerta)
-        rect->bg_color = (NvOSD_ColorParams){0.9f, 0.0f, 0.0f, 0.4f};
+        rect->bg_color = (NvOSD_ColorParams){1.0f, 0.0f, 0.0f, 0.6f};
       }
       nvds_add_display_meta_to_frame (frame_meta, display_meta);
     }
