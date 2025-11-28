@@ -73,40 +73,9 @@ get_timestamp_str(gdouble now, char* buffer, size_t size)
   snprintf(buffer, size, "%d:%02d", mm, ss);
 }
 
-// Escritura del header al finalizar
-static void
-write_report_header()
-{
-  if (!report_fp) return;
-  
-  fclose(report_fp);
-  
-  // Leer contenido existente
-  FILE *temp = fopen(report_path.c_str(), "r");
-  std::string content;
-  if (temp) {
-    char buffer[4096];
-    while (size_t len = fread(buffer, 1, sizeof(buffer) - 1, temp)) {
-      buffer[len] = '\0';
-      content += buffer;
-    }
-    fclose(temp);
-  }
-  
-  // Reescribir
-  report_fp = fopen(report_path.c_str(), "w");
-  if (report_fp) {
-    fprintf(report_fp, "ROI: left: %d top: %d width: %d height: %d\n",
-            roi_cfg.roi_x_px, roi_cfg.roi_y_px, 
-            roi_cfg.roi_w_px, roi_cfg.roi_h_px);
-    fprintf(report_fp, "Max time: %.0fs\n", roi_cfg.max_dwell_time);
-    fprintf(report_fp, "Detected: %u (%u)\n", g_total_detections, g_total_overtime);
-    fputs(content.c_str(), report_fp);
-    fclose(report_fp);
-    report_fp = nullptr;
-  }
-}
-
+/* ------------------------------------------------------------------------ */
+/* Bus callback (gestion de errores y fin de stream)                       */
+/* ------------------------------------------------------------------------ */
 static gboolean
 bus_call (GstBus *bus, GstMessage *msg, gpointer data)
 {
@@ -116,7 +85,13 @@ bus_call (GstBus *bus, GstMessage *msg, gpointer data)
     case GST_MESSAGE_EOS:
       g_print ("\n=== End of stream ===\n");
       g_print ("Detected: %u (%u)\n", g_total_detections, g_total_overtime);
-      write_report_header();
+      
+      // Cierre del archivo de reporte (cambio implementado)
+      if (report_fp) {
+        fclose(report_fp);
+        report_fp = nullptr;
+      }
+      
       g_main_loop_quit (loop);
       break;
 
@@ -153,7 +128,9 @@ cb_new_pad (GstElement *qtdemux, GstPad *pad, gpointer data)
   g_free (name);
 }
 
-// Probe principal optimizado
+/* ------------------------------------------------------------------------ */
+/* Pad probe principal: Logica ROI y OSD                                    */
+/* ------------------------------------------------------------------------ */
 static GstPadProbeReturn
 osd_sink_pad_buffer_probe (GstPad *pad, GstPadProbeInfo *info, gpointer u_data)
 {
@@ -168,41 +145,38 @@ osd_sink_pad_buffer_probe (GstPad *pad, GstPadProbeInfo *info, gpointer u_data)
     NvDsFrameMeta *frame_meta = (NvDsFrameMeta *) l_frame->data;
     gboolean roi_has_obj = FALSE;
 
-    // Bucle de objetos
+    // 1. Detectar si hay objetos en la ROI
     for (NvDsMetaList *l_obj = frame_meta->obj_meta_list; l_obj != nullptr; l_obj = l_obj->next) {
       NvDsObjectMeta *obj_meta = (NvDsObjectMeta *) l_obj->data;
 
-      // Clase 2 = Persona
+      // Filtrar solo personas (ID 2)
       if (obj_meta->class_id != 2) {
-        // Ocultar objetos no relevantes
         obj_meta->rect_params.border_width = 0;
         obj_meta->rect_params.has_bg_color = 0;
         obj_meta->text_params.display_text = NULL;
         continue;
       }
 
-      // Optimizacion: Usar los valores pre-calculados en pixeles
-      // en lugar de multiplicar floats en cada iteracion
       float x = obj_meta->rect_params.left;
       float y = obj_meta->rect_params.top;
       float w = obj_meta->rect_params.width;
       float h = obj_meta->rect_params.height;
 
-      // Logica de ROI (todo el cuerpo dentro)
+      // Usar coordenadas cacheadas en pixeles
       if (x >= roi_cfg.roi_x_px &&
           x + w <= roi_cfg.roi_x_px + roi_cfg.roi_w_px &&
           y >= roi_cfg.roi_y_px &&
           y + h <= roi_cfg.roi_y_px + roi_cfg.roi_h_px) {
         roi_has_obj = TRUE;
-        break; // Ya encontramos uno, no necesitamos revisar mas para activar la ROI
+        break; 
       }
     }
 
-    // Maquina de estados de la ROI
+    // 2. Logica de Estados y Tiempo (Escritura CSV)
     char time_buf[32];
     
     if (roi_has_obj && !roi_cfg.roi_occupied) {
-      // ENTER
+      // ENTER: Persona entra
       roi_cfg.roi_occupied = TRUE;
       roi_cfg.roi_over_threshold = FALSE;
       roi_cfg.roi_entry_ts = now;
@@ -210,12 +184,14 @@ osd_sink_pad_buffer_probe (GstPad *pad, GstPadProbeInfo *info, gpointer u_data)
       get_timestamp_str(now, time_buf, sizeof(time_buf));
       g_print ("%s ENTER\n", time_buf);
 
+      // Escribir evento ENTER en CSV
       if (report_fp) {
         fprintf (report_fp, "ENTER,%.3f,,\n", now - g_t0);
+        fflush(report_fp);
       }
 
     } else if (!roi_has_obj && roi_cfg.roi_occupied) {
-      // EXIT
+      // EXIT: Persona sale
       gdouble dwell = now - roi_cfg.roi_entry_ts;
       gboolean overtime = (dwell > roi_cfg.max_dwell_time);
 
@@ -225,30 +201,37 @@ osd_sink_pad_buffer_probe (GstPad *pad, GstPadProbeInfo *info, gpointer u_data)
       get_timestamp_str(now, time_buf, sizeof(time_buf));
       g_print ("%s person time %ds%s\n", time_buf, (int)(dwell + 0.5), overtime ? " alert" : "");
 
+      // Escribir evento EXIT en CSV
       if (report_fp) {
         fprintf (report_fp, "EXIT,%.3f,%.3f,%s\n", now - g_t0, dwell, overtime ? "OVERTIME" : "OK");
+        fflush(report_fp);
       }
 
+      // Resetear estado
       roi_cfg.roi_occupied = FALSE;
       roi_cfg.roi_over_threshold = FALSE;
       roi_cfg.roi_entry_ts = 0.0;
 
-    } else if (roi_has_obj && roi_cfg.roi_occupied && !roi_cfg.roi_over_threshold) {
-      // CHECK TIMEOUT
+    } else if (roi_has_obj && roi_cfg.roi_occupied) {
+      // STAY: Persona sigue dentro, verificar tiempo
       gdouble dwell = now - roi_cfg.roi_entry_ts;
-      if (dwell > roi_cfg.max_dwell_time) {
+      
+      // Si supera el tiempo, marcar flag global OVERTIME
+      if (!roi_cfg.roi_over_threshold && dwell > roi_cfg.max_dwell_time) {
         roi_cfg.roi_over_threshold = TRUE;
         
         get_timestamp_str(now, time_buf, sizeof(time_buf));
         g_print ("%s OVERTIME person time %ds (max %.0fs)\n", time_buf, (int)(dwell + 0.5), roi_cfg.max_dwell_time);
 
+        // Escribir evento OVERTIME en CSV
         if (report_fp) {
           fprintf (report_fp, "OVERTIME,%.3f,%.3f,OVERTIME\n", now - g_t0, dwell);
+          fflush(report_fp);
         }
       }
     }
 
-    // Dibujar ROI en pantalla
+    // 3. Dibujar ROI (OSD)
     NvDsDisplayMeta *display_meta = nvds_acquire_display_meta_from_pool (batch_meta);
     if (display_meta) {
       display_meta->num_rects = 1;
@@ -258,21 +241,26 @@ osd_sink_pad_buffer_probe (GstPad *pad, GstPadProbeInfo *info, gpointer u_data)
       rect->top    = roi_cfg.roi_y_px;
       rect->width  = roi_cfg.roi_w_px;
       rect->height = roi_cfg.roi_h_px;
-      rect->border_width = 3;
+      rect->border_width = 4;
       rect->has_bg_color = 1;
-      rect->border_color = (NvOSD_ColorParams){1.0f, 1.0f, 1.0f, 1.0f}; // Blanco
+      
+      rect->border_color.red = 1.0; 
+      rect->border_color.green = 1.0; 
+      rect->border_color.blue = 1.0; 
+      rect->border_color.alpha = 1.0;
 
-      // Seleccion de color eficiente
+      // Logica de colores
       if (!roi_cfg.roi_occupied) {
-        // Verde suave (Vacio)
-        rect->bg_color = (NvOSD_ColorParams){0.0f, 0.6f, 0.0f, 0.2f};
+        // ESTADO 1: VACIO -> Verde Suave
+        rect->bg_color.red = 0.0; rect->bg_color.green = 0.6; rect->bg_color.blue = 0.0; rect->bg_color.alpha = 0.2; 
       } else if (!roi_cfg.roi_over_threshold) {
-        // Verde intenso (Ocupado OK)
-        rect->bg_color = (NvOSD_ColorParams){0.0f, 0.9f, 0.0f, 0.3f};
+        // ESTADO 2: OCUPADO (Tiempo OK) -> Verde Intenso
+        rect->bg_color.red = 0.0; rect->bg_color.green = 0.9; rect->bg_color.blue = 0.0; rect->bg_color.alpha = 0.3; 
       } else {
-        // Rojo (Alerta)
-        rect->bg_color = (NvOSD_ColorParams){1.0f, 0.0f, 0.0f, 0.6f};
+        // ESTADO 3: ALERTA (Tiempo Excedido) -> ROJO PURO y mas solido
+        rect->bg_color.red = 1.0; rect->bg_color.green = 0.0; rect->bg_color.blue = 0.0; rect->bg_color.alpha = 0.6;
       }
+
       nvds_add_display_meta_to_frame (frame_meta, display_meta);
     }
   }
@@ -288,11 +276,10 @@ parse_arguments(int argc, char *argv[])
     return FALSE;
   }
 
-  // Mapa simple de parametros requeridos
   int params_found = 0;
   
   for (int i = 1; i < argc; i++) {
-    if (i + 1 >= argc) continue; // Evitar overflow
+    if (i + 1 >= argc) continue;
 
     if (!g_strcmp0(argv[i], "vi-file")) {
       input_file_path = argv[++i]; params_found++;
@@ -326,6 +313,9 @@ parse_arguments(int argc, char *argv[])
   return TRUE;
 }
 
+/* ------------------------------------------------------------------------ */
+/* MAIN                                                                     */
+/* ------------------------------------------------------------------------ */
 int
 main (int argc, char *argv[])
 {
@@ -336,19 +326,28 @@ main (int argc, char *argv[])
   calculate_roi_pixels();
   roi_cfg.roi_occupied = FALSE;
   
-  // Inicializar CSV
+  // Abrir archivo de reporte CSV
   report_fp = fopen(report_path.c_str(), "w");
   if (!report_fp) {
     g_printerr("Error abriendo reporte %s\n", report_path.c_str());
     return -1;
   }
+
+  // ⚠️ IMPLEMENTACION DE CAMBIO: Escribir METADATA y ENCABEZADO CSV (al inicio)
+  // Escribir Metadata legible (no CSV, marcada con #)
+  fprintf(report_fp, "# ROI: left: %d top: %d width: %d height: %d\n",
+          roi_cfg.roi_x_px, roi_cfg.roi_y_px, 
+          roi_cfg.roi_w_px, roi_cfg.roi_h_px);
+  fprintf(report_fp, "# Max time: %.0fs\n", roi_cfg.max_dwell_time);
+  
+  // Escribir Encabezado CSV
   fprintf(report_fp, "event,time,dwell,flag\n");
-  // No hacemos fflush aqui para ganar velocidad, el SO se encarga o el fclose final
+  fflush(report_fp); // Asegurar que el encabezado se escribe inmediatamente
 
   GMainLoop *loop = g_main_loop_new(nullptr, FALSE);
   GstElement *pipeline = gst_pipeline_new("ds-roi-app");
   
-  // Creacion de elementos masiva
+  // Creacion de elementos
   GstElement *source      = gst_element_factory_make("filesrc", "src");
   GstElement *qtdemux     = gst_element_factory_make("qtdemux", "demux");
   GstElement *h264parser  = gst_element_factory_make("h264parse", "parse1");
@@ -451,6 +450,19 @@ main (int argc, char *argv[])
   GstBus *bus = gst_pipeline_get_bus(GST_PIPELINE(pipeline));
   guint bus_watch_id = gst_bus_add_watch(bus, bus_call, loop);
   gst_object_unref(bus);
+
+  g_print("\n=== Configuracion del Sistema ===\n");
+  g_print("Archivo de entrada: %s\n", input_file_path.c_str());
+  g_print("ROI (normalizado): left: %.2f top: %.2f width: %.2f height: %.2f\n",
+          roi_cfg.roi_x, roi_cfg.roi_y, roi_cfg.roi_w, roi_cfg.roi_h);
+  g_print("ROI (pixeles): left: %d top: %d width: %d height: %d\n",
+          roi_cfg.roi_x_px, roi_cfg.roi_y_px, roi_cfg.roi_w_px, roi_cfg.roi_h_px);
+  g_print("Tiempo maximo: %.0fs\n", roi_cfg.max_dwell_time);
+  g_print("Modo: %s\n", g_mode == MODE_VIDEO ? "video" : 
+                       g_mode == MODE_UDP ? "udp" : "both");
+  g_print("Reporte: %s\n", report_path.c_str());
+  g_print("Salida: %s\n", output_file_path.c_str());
+  g_print("================================\n\n");
 
   g_print("Pipeline ejecutandose...\n");
   gst_element_set_state(pipeline, GST_STATE_PLAYING);
